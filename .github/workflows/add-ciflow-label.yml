@@ -184,6 +184,48 @@ jobs:
             });
             core.setFailed('Some labels are not allowed.');
 
+      - name: Resolve PR head SHA
+        if: steps.parse.outputs.skip == 'false' && steps.authz.outputs.authorized == 'true' && steps.validate_labels.outputs.bad_labels == '[]'
+        id: pr_sha
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.TORCHAO_PAT }}
+          script: |
+            const [owner, repo] = process.env.TARGET_REPO.split('/');
+            const prNumber = parseInt('${{ steps.parse.outputs.pr_number }}', 10);
+            try {
+              const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+              core.setOutput('sha', pr.data.head.sha);
+            } catch (e) {
+              core.setFailed(`PR ${owner}/${repo}#${prNumber} not found: ${e.message}`);
+            }
+
+      - name: Approve pending workflow runs (pre-label)
+        if: steps.pr_sha.outputs.sha
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.TORCHAO_PAT }}
+          script: |
+            const [owner, repo] = process.env.TARGET_REPO.split('/');
+            const sha = '${{ steps.pr_sha.outputs.sha }}';
+            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+              owner, repo, head_sha: sha, status: 'action_required', per_page: 100,
+            });
+            core.info(`Found ${runs.length} pending run(s) for ${sha} pre-label.`);
+            const approved = [];
+            for (const r of runs) {
+              try {
+                await github.request('POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve', {
+                  owner, repo, run_id: r.id,
+                });
+                approved.push(`${r.name}#${r.id}`);
+                core.info(`Approved ${r.name} (${r.id})`);
+              } catch (e) {
+                core.warning(`Approve ${r.id} failed: ${e.message}`);
+              }
+            }
+            core.setOutput('approved_pre', JSON.stringify(approved));
+
       - name: Add labels to pytorch/ao PR
         if: steps.parse.outputs.skip == 'false' && steps.authz.outputs.authorized == 'true' && steps.validate_labels.outputs.bad_labels == '[]'
         id: add
@@ -194,23 +236,50 @@ jobs:
             const [owner, repo] = process.env.TARGET_REPO.split('/');
             const prNumber = parseInt('${{ steps.parse.outputs.pr_number }}', 10);
             const labels = JSON.parse('${{ steps.validate_labels.outputs.ok_labels }}');
-
-            // Verify the PR exists
-            try {
-              await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
-            } catch (e) {
-              core.setFailed(`PR ${owner}/${repo}#${prNumber} not found: ${e.message}`);
-              return;
-            }
-
             await github.rest.issues.addLabels({
               owner,
               repo,
               issue_number: prNumber,
               labels,
             });
-
             core.setOutput('added', JSON.stringify(labels));
+
+      - name: Approve workflow runs triggered by the new label
+        if: steps.add.outputs.added && steps.pr_sha.outputs.sha
+        id: approve_post
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.TORCHAO_PAT }}
+          script: |
+            const [owner, repo] = process.env.TARGET_REPO.split('/');
+            const sha = '${{ steps.pr_sha.outputs.sha }}';
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+            // Poll up to ~3 minutes for new action_required runs to appear,
+            // approving each as we see them.
+            const seen = new Set();
+            const approved = [];
+            const deadline = Date.now() + 3 * 60 * 1000;
+            while (Date.now() < deadline) {
+              const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+                owner, repo, head_sha: sha, status: 'action_required', per_page: 100,
+              });
+              for (const r of runs) {
+                if (seen.has(r.id)) continue;
+                seen.add(r.id);
+                try {
+                  await github.request('POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve', {
+                    owner, repo, run_id: r.id,
+                  });
+                  approved.push(`${r.name}#${r.id}`);
+                  core.info(`Approved ${r.name} (${r.id})`);
+                } catch (e) {
+                  core.warning(`Approve ${r.id} failed: ${e.message}`);
+                }
+              }
+              await sleep(15000);
+            }
+            core.setOutput('approved_post', JSON.stringify(approved));
 
       - name: Comment success and close issue
         if: success() && steps.parse.outputs.skip == 'false' && steps.add.outputs.added
@@ -221,17 +290,25 @@ jobs:
             const prNumber = parseInt('${{ steps.parse.outputs.pr_number }}', 10);
             const labels = JSON.parse('${{ steps.add.outputs.added }}');
             const actor = '${{ steps.parse.outputs.actor }}';
+            let approvedPost = [];
+            try { approvedPost = JSON.parse(`${{ steps.approve_post.outputs.approved_post || '[]' }}`); } catch (e) {}
+
+            const lines = [
+              `:white_check_mark: @${actor}, added the following labels to`,
+              `[pytorch/ao#${prNumber}](https://github.com/pytorch/ao/pull/${prNumber}):`,
+              ``,
+              labels.map(l => `- \`${l}\``).join('\n'),
+            ];
+            if (approvedPost.length > 0) {
+              lines.push('');
+              lines.push(`Approved ${approvedPost.length} workflow run(s) triggered by the new label.`);
+            }
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: issueNumber,
-              body: [
-                `:white_check_mark: @${actor}, added the following labels to`,
-                `[pytorch/ao#${prNumber}](https://github.com/pytorch/ao/pull/${prNumber}):`,
-                ``,
-                labels.map(l => `- \`${l}\``).join('\n'),
-              ].join('\n'),
+              body: lines.join('\n'),
             });
 
             // Only close if the trigger was an issue (not a comment)
