@@ -1,0 +1,260 @@
+name: Add ciflow label to pytorch/ao PR
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  add-label:
+    # Skip comments that the bot itself made
+    if: ${{ github.event.sender.type != 'Bot' }}
+    runs-on: ubuntu-latest
+    env:
+      TARGET_REPO: pytorch/ao
+      ALLOWED_LABELS: |
+        ciflow/xpu
+        ciflow/xpu-periodic
+        topic: xpu
+      # Optional extra usernames (comma-separated) allowed to trigger labeling,
+      # in addition to members of the `pytorch` org.
+      EXTRA_AUTHORIZED_USERS: ""
+
+    steps:
+      - name: Parse request
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const event = context.eventName;
+            let prNumber = null;
+            let labels = [];
+            let issueNumber = null;
+            let actor = null;
+
+            if (event === 'issues') {
+              const issue = context.payload.issue;
+              issueNumber = issue.number;
+              actor = issue.user.login;
+
+              // Parse the issue form body. Form fields appear as:
+              //   ### PR number
+              //
+              //   1234
+              //
+              //   ### Labels to add
+              //
+              //   ciflow/xpu
+              const body = issue.body || '';
+              const prMatch = body.match(/###\s*PR number\s*\n+\s*([0-9]+)/i);
+              const labelMatch = body.match(/###\s*Labels to add\s*\n+\s*([^\n#]+)/i);
+
+              if (prMatch) prNumber = parseInt(prMatch[1], 10);
+              if (labelMatch) {
+                labels = labelMatch[1].split(',').map(s => s.trim()).filter(Boolean);
+              }
+
+              // Fallback: try to extract `#1234` from title
+              if (!prNumber) {
+                const titleMatch = (issue.title || '').match(/#\s*([0-9]+)/);
+                if (titleMatch) prNumber = parseInt(titleMatch[1], 10);
+              }
+            } else if (event === 'issue_comment') {
+              const comment = context.payload.comment;
+              issueNumber = context.payload.issue.number;
+              actor = comment.user.login;
+
+              // Match: /add-label <pr> <label1>[,<label2>...]
+              const m = (comment.body || '').match(
+                /^\s*\/add-label\s+([0-9]+)\s+([^\s].*?)\s*$/m
+              );
+              if (!m) {
+                core.info('Comment is not an /add-label command, skipping.');
+                core.setOutput('skip', 'true');
+                return;
+              }
+              prNumber = parseInt(m[1], 10);
+              labels = m[2].split(',').map(s => s.trim()).filter(Boolean);
+            }
+
+            if (!prNumber || labels.length === 0) {
+              core.info('No PR number or labels parsed, skipping.');
+              core.setOutput('skip', 'true');
+              return;
+            }
+
+            core.setOutput('skip', 'false');
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('labels', JSON.stringify(labels));
+            core.setOutput('issue_number', String(issueNumber));
+            core.setOutput('actor', actor);
+
+      - name: Validate labels against allow-list
+        if: steps.parse.outputs.skip == 'false'
+        id: validate_labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const allowed = process.env.ALLOWED_LABELS
+              .split('\n').map(s => s.trim()).filter(Boolean);
+            const requested = JSON.parse('${{ steps.parse.outputs.labels }}');
+            const ok = [];
+            const bad = [];
+            for (const l of requested) {
+              if (allowed.includes(l)) ok.push(l);
+              else bad.push(l);
+            }
+            core.setOutput('ok_labels', JSON.stringify(ok));
+            core.setOutput('bad_labels', JSON.stringify(bad));
+
+      - name: Authorize requester
+        if: steps.parse.outputs.skip == 'false'
+        id: authz
+        uses: actions/github-script@v7
+        with:
+          # Use the elevated token so we can read org membership.
+          github-token: ${{ secrets.TORCHAO_PAT }}
+          script: |
+            const actor = '${{ steps.parse.outputs.actor }}';
+            const extras = (process.env.EXTRA_AUTHORIZED_USERS || '')
+              .split(',').map(s => s.trim()).filter(Boolean);
+            if (extras.includes(actor)) {
+              core.setOutput('authorized', 'true');
+              return;
+            }
+            // Check pytorch org membership
+            try {
+              await github.rest.orgs.checkMembershipForUser({
+                org: 'pytorch',
+                username: actor,
+              });
+              core.setOutput('authorized', 'true');
+            } catch (e) {
+              core.warning(`User ${actor} is not a public member of pytorch org: ${e.message}`);
+              core.setOutput('authorized', 'false');
+            }
+
+      - name: Reject unauthorized
+        if: steps.parse.outputs.skip == 'false' && steps.authz.outputs.authorized != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = parseInt('${{ steps.parse.outputs.issue_number }}', 10);
+            const actor = '${{ steps.parse.outputs.actor }}';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: [
+                `@${actor} sorry, you are not authorized to trigger CI labels.`,
+                ``,
+                `Authorized users are public members of the \`pytorch\` org or`,
+                `the explicit allow-list configured in this workflow.`,
+              ].join('\n'),
+            });
+            core.setFailed('Unauthorized requester.');
+
+      - name: Reject bad labels
+        if: steps.parse.outputs.skip == 'false' && steps.authz.outputs.authorized == 'true' && steps.validate_labels.outputs.bad_labels != '[]'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const bad = JSON.parse('${{ steps.validate_labels.outputs.bad_labels }}');
+            const issueNumber = parseInt('${{ steps.parse.outputs.issue_number }}', 10);
+            const allowed = process.env.ALLOWED_LABELS
+              .split('\n').map(s => s.trim()).filter(Boolean);
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: [
+                `:x: The following labels are not in the allow-list and were rejected:`,
+                ``,
+                bad.map(l => `- \`${l}\``).join('\n'),
+                ``,
+                `Allowed labels:`,
+                ``,
+                allowed.map(l => `- \`${l}\``).join('\n'),
+              ].join('\n'),
+            });
+            core.setFailed('Some labels are not allowed.');
+
+      - name: Add labels to pytorch/ao PR
+        if: steps.parse.outputs.skip == 'false' && steps.authz.outputs.authorized == 'true' && steps.validate_labels.outputs.bad_labels == '[]'
+        id: add
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.TORCHAO_PAT }}
+          script: |
+            const [owner, repo] = process.env.TARGET_REPO.split('/');
+            const prNumber = parseInt('${{ steps.parse.outputs.pr_number }}', 10);
+            const labels = JSON.parse('${{ steps.validate_labels.outputs.ok_labels }}');
+
+            // Verify the PR exists
+            try {
+              await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            } catch (e) {
+              core.setFailed(`PR ${owner}/${repo}#${prNumber} not found: ${e.message}`);
+              return;
+            }
+
+            await github.rest.issues.addLabels({
+              owner,
+              repo,
+              issue_number: prNumber,
+              labels,
+            });
+
+            core.setOutput('added', JSON.stringify(labels));
+
+      - name: Comment success and close issue
+        if: success() && steps.parse.outputs.skip == 'false' && steps.add.outputs.added
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = parseInt('${{ steps.parse.outputs.issue_number }}', 10);
+            const prNumber = parseInt('${{ steps.parse.outputs.pr_number }}', 10);
+            const labels = JSON.parse('${{ steps.add.outputs.added }}');
+            const actor = '${{ steps.parse.outputs.actor }}';
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: [
+                `:white_check_mark: @${actor}, added the following labels to`,
+                `[pytorch/ao#${prNumber}](https://github.com/pytorch/ao/pull/${prNumber}):`,
+                ``,
+                labels.map(l => `- \`${l}\``).join('\n'),
+              ].join('\n'),
+            });
+
+            // Only close if the trigger was an issue (not a comment)
+            if (context.eventName === 'issues') {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+            }
+
+      - name: Comment failure
+        if: failure() && steps.parse.outputs.skip == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = parseInt('${{ steps.parse.outputs.issue_number }}', 10);
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: `:x: Failed to add labels. See [workflow run](${runUrl}) for details.`,
+            });

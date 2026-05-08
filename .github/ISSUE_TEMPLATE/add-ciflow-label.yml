@@ -1,0 +1,38 @@
+name: Add ciflow label
+description: Request a ciflow/* label to be added to a pytorch/ao PR (triggers XPU CI).
+title: "[ciflow] add label to pytorch/ao#<PR>"
+labels: ["add-ciflow-label"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to request that a `ciflow/*` label be added to a PR in
+        [`pytorch/ao`](https://github.com/pytorch/ao). After you submit, a bot
+        will add the label, comment with the result, and close this issue.
+
+  - type: input
+    id: pr_number
+    attributes:
+      label: PR number
+      description: The pull request number in `pytorch/ao` (just the number, no `#`).
+      placeholder: "1234"
+    validations:
+      required: true
+
+  - type: input
+    id: labels
+    attributes:
+      label: Labels to add
+      description: Comma-separated list of labels. Must be in the allow-list (see README).
+      placeholder: "ciflow/xpu"
+      value: "ciflow/xpu"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reason
+    attributes:
+      label: Reason (optional)
+      description: Why do you need XPU CI on this PR?
+    validations:
+      required: false
