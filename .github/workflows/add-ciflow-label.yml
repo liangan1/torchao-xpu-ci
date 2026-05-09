@@ -23,7 +23,7 @@ jobs:
         topic: xpu
       # Optional extra usernames (comma-separated) allowed to trigger labeling,
       # in addition to members of the `pytorch` org.
-      EXTRA_AUTHORIZED_USERS: "liangan1"
+      EXTRA_AUTHORIZED_USERS: "liangan1,kgajdamo"
 
     steps:
       - name: Parse request
