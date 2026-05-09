@@ -124,20 +124,62 @@ jobs:
             const extras = (process.env.EXTRA_AUTHORIZED_USERS || '')
               .split(',').map(s => s.trim()).filter(Boolean);
             if (extras.includes(actor)) {
+              core.info(`Authorized: ${actor} is in EXTRA_AUTHORIZED_USERS.`);
               core.setOutput('authorized', 'true');
               return;
             }
-            // Check pytorch org membership
+
+            const [tOwner, tRepo] = process.env.TARGET_REPO.split('/');
+            const prNumber = parseInt('${{ steps.parse.outputs.pr_number }}', 10);
+
+            // 1) Allow anyone with triage/write/maintain/admin on the target repo
+            //    (i.e. anyone who could manually add the label themselves).
+            try {
+              const r = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: tOwner, repo: tRepo, username: actor,
+              });
+              const perm = r.data.permission; // admin|maintain|write|triage|read|none
+              if (['admin', 'maintain', 'write', 'triage'].includes(perm)) {
+                core.info(`Authorized: ${actor} has '${perm}' on ${tOwner}/${tRepo}.`);
+                core.setOutput('authorized', 'true');
+                return;
+              }
+              core.info(`${actor} has only '${perm}' on ${tOwner}/${tRepo}.`);
+            } catch (e) {
+              core.warning(`getCollaboratorPermissionLevel failed for ${actor}: ${e.message}`);
+            }
+
+            // 2) Allow the PR author to label their own PR.
+            if (prNumber) {
+              try {
+                const pr = await github.rest.pulls.get({
+                  owner: tOwner, repo: tRepo, pull_number: prNumber,
+                });
+                if (pr.data.user && pr.data.user.login === actor) {
+                  core.info(`Authorized: ${actor} is author of ${tOwner}/${tRepo}#${prNumber}.`);
+                  core.setOutput('authorized', 'true');
+                  return;
+                }
+              } catch (e) {
+                core.warning(`pulls.get failed: ${e.message}`);
+              }
+            }
+
+            // 3) Fallback: pytorch org public member.
             try {
               await github.rest.orgs.checkMembershipForUser({
                 org: 'pytorch',
                 username: actor,
               });
+              core.info(`Authorized: ${actor} is a public member of pytorch org.`);
               core.setOutput('authorized', 'true');
+              return;
             } catch (e) {
-              core.warning(`User ${actor} is not a public member of pytorch org: ${e.message}`);
-              core.setOutput('authorized', 'false');
+              core.info(`${actor} is not a public member of pytorch org.`);
             }
+
+            core.warning(`User ${actor} is not authorized.`);
+            core.setOutput('authorized', 'false');
 
       - name: Reject unauthorized
         if: steps.parse.outputs.skip == 'false' && steps.authz.outputs.authorized != 'true'
@@ -153,8 +195,11 @@ jobs:
               body: [
                 `@${actor} sorry, you are not authorized to trigger CI labels.`,
                 ``,
-                `Authorized users are public members of the \`pytorch\` org or`,
-                `the explicit allow-list configured in this workflow.`,
+                `Authorized requesters are any of:`,
+                `- Users with **Triage** or higher permission on \`pytorch/ao\``,
+                `- The author of the target PR`,
+                `- Public members of the \`pytorch\` GitHub org`,
+                `- Users in the workflow's \`EXTRA_AUTHORIZED_USERS\` allow-list`,
               ].join('\n'),
             });
             core.setFailed('Unauthorized requester.');
