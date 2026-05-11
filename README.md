@@ -56,6 +56,7 @@ Only labels in the allow-list are accepted (configured in
 - `ciflow/xpu`
 - `ciflow/xpu-periodic`
 - `topic: xpu`
+- `module: not user facing`
 
 To extend the list, edit `ALLOWED_LABELS` in the workflow file.
 
