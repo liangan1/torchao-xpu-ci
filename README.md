@@ -56,6 +56,10 @@ Only labels in the allow-list are accepted (configured in
 - `ciflow/xpu`
 - `ciflow/xpu-periodic`
 - `topic: xpu`
+- `xpu`
+
+When any `ciflow/xpu*` label is added, the `xpu` label is also added automatically
+as a companion (configured via `AUTO_COMPANION_LABEL`).
 
 To extend the list, edit `ALLOWED_LABELS` in the workflow file.
 

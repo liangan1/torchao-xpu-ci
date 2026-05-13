@@ -21,6 +21,10 @@ jobs:
         ciflow/xpu
         ciflow/xpu-periodic
         topic: xpu
+        xpu
+      # Labels that, when present, will trigger auto-adding companion labels.
+      # When any of `ciflow/xpu` or `ciflow/xpu-periodic` is requested, also add `xpu`.
+      AUTO_COMPANION_LABEL: "xpu"
       # Optional extra usernames (comma-separated) allowed to trigger labeling,
       # in addition to members of the `pytorch` org.
       EXTRA_AUTHORIZED_USERS: "liangan1,kgajdamo,xiaowangintel,zxd1997066,ugolowic,arlesniak,karol-brejna-i,Stonepia,hoshibara"
@@ -108,6 +112,12 @@ jobs:
             for (const l of requested) {
               if (allowed.includes(l)) ok.push(l);
               else bad.push(l);
+            }
+            // Auto-append companion `xpu` label whenever any ciflow/xpu* label is added.
+            const companion = process.env.AUTO_COMPANION_LABEL;
+            if (companion && ok.some(l => l.startsWith('ciflow/xpu')) && !ok.includes(companion)) {
+              ok.push(companion);
+              core.info(`Auto-added companion label: ${companion}`);
             }
             core.setOutput('ok_labels', JSON.stringify(ok));
             core.setOutput('bad_labels', JSON.stringify(bad));
