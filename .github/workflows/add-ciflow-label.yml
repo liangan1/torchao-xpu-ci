@@ -291,6 +291,26 @@ jobs:
             const [owner, repo] = process.env.TARGET_REPO.split('/');
             const prNumber = parseInt('${{ steps.parse.outputs.pr_number }}', 10);
             const labels = JSON.parse('${{ steps.validate_labels.outputs.ok_labels }}');
+
+            // Remove labels that already exist on the PR so re-adding them
+            // generates a fresh "labeled" event and re-triggers CI.
+            const existing = await github.rest.issues.listLabelsOnIssue({
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+            const existingNames = new Set(existing.data.map(l => l.name));
+            for (const label of labels) {
+              if (existingNames.has(label)) {
+                core.info(`Removing existing label '${label}' to re-trigger CI.`);
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner, repo, issue_number: prNumber, name: label,
+                  });
+                } catch (e) {
+                  core.warning(`Failed to remove label '${label}': ${e.message}`);
+                }
+              }
+            }
+
             await github.rest.issues.addLabels({
               owner,
               repo,
